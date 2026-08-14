@@ -7,11 +7,10 @@ a small compressed preview when it finishes, and a *Fetch full-res* button
 for when you actually want the big files. Built for bad hotel wifi: a run
 costs a few KB up and ~100 KB down.
 
-Companion to [ComfyCast CLI](https://github.com/AGBKdev/ComfyCast-CLI) — they share the same
-`~/.comfycast.json` config, but neither requires the other. ComfyCast is
-fully usable without ever opening a terminal: a **⚙ settings panel** in the
-UI asks for your remote's address (Tailscale IP or hostname) and shows a
-**green/red connection light** on the button.
+No terminal required: a **⚙ settings panel** in the UI asks for your remote's
+address (Tailscale IP or hostname) and shows a **green/red connection light**
+on the button. Settings live in `~/.comfycast.json` if you would rather edit
+them by hand.
 
 ## Before you start (prerequisites)
 
@@ -116,8 +115,7 @@ Next to the run button there's a **models** switch:
   never touched) and dropdowns show just what's really on this machine, for
   when you want to run locally.
 
-Switching refreshes the dropdowns in place. The same toggle exists in the
-CLI as `comfycast on` / `comfycast off`.
+Switching refreshes the dropdowns in place.
 
 ## Requirements on the remote
 
@@ -127,11 +125,16 @@ Nothing to install on the remote.
 
 ## Keeping editor and remote in sync
 
-The editor can only author with node packs and model names it knows.
-The [ComfyCast CLI](https://github.com/AGBKdev/ComfyCast-CLI) automates that:
-`comfycast stubs` mirrors the remote's model names locally as zero-byte files,
-`comfycast parity` diffs ComfyUI versions, node packs, and models between
-the two sides.
+The editor can only author with node packs and model names it knows about.
+
+**Model names are handled** — that is what the models toggle above does. Switch
+to REMOTE and your dropdowns list everything on the remote, as zero-byte stubs,
+cached so it works offline.
+
+**Node packs are not.** If a workflow uses a node the remote does not have, you
+find out when the run is rejected — the panel shows the exact per-node reason,
+so it is a clear failure rather than a silent one, but nothing here diffs the
+two installs for you in advance. Install the same packs on both sides.
 
 ## How it works
 
