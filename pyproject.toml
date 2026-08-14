@@ -1,0 +1,14 @@
+[project]
+name = "comfycast"
+description = "Run-on-Box button for ComfyUI: execute the workflow you're editing on a remote GPU machine, with live progress, compressed previews, and on-demand full-res fetch."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/AGBKdev/ComfyCast"
+
+[tool.comfy]
+PublisherId = "agbk"
+DisplayName = "ComfyCast"
+Icon = ""

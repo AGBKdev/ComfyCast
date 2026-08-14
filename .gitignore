@@ -1,0 +1,14 @@
+# Python bytecode. A .pyc embeds the absolute path of the machine that compiled
+# it (co_filename), so one committed by accident publishes your directory layout.
+__pycache__/
+*.py[cod]
+
+# macOS / editor droppings
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local runtime state
+output/
+*.log
