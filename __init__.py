@@ -516,10 +516,16 @@ async def stop(request):
             pass
     except Exception:
         pass
-    # interrupt current execution ONLY if our job is (or may be) the one running —
-    # never kill someone else's job that's ahead in the queue
+    # Interrupt current execution ONLY if OUR job is (or may be) the one
+    # running — never kill someone else's.
+    #
+    # `j is None` used to be the first disjunct here, which inverted the whole
+    # intent: an unrecognised pid is exactly the case where we know nothing
+    # about ownership, and it interrupted unconditionally. On a shared or
+    # rented box that stopped a stranger's render, and /comfycast/stop takes
+    # the pid straight from the query string.
     interrupted = False
-    if j is None or j.get("current") is not None or not j.get("queue_ahead"):
+    if j is not None and (j.get("current") is not None or not j.get("queue_ahead")):
         try:
             async with session.post(f"{base}/interrupt",
                                     timeout=aiohttp.ClientTimeout(total=10)) as r:

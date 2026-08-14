@@ -89,10 +89,11 @@ you work with more than one remote you always know where a run will land
   falls back to polling; the run always survives a dropped connection
 - a **■ Stop** button — interrupts the run on the remote (or pulls it from
   the queue if it hasn't started)
-- **the canvas mirrors the remote run** — the currently executing node gets
-  the same green outline as a local run, and a failing node is flagged red,
-  because ComfyCast re-dispatches the remote's execution events into your
-  local frontend
+- progress lives **in the ComfyCast panel**, not on the canvas. ComfyCast does
+  re-dispatch the remote's execution events into the local frontend, and on
+  older frontends that lit up the running node with the usual green outline —
+  it does not on current ones, so treat the panel as the source of truth. The
+  run itself is unaffected either way
 - **all errors pass through**: a rejected workflow shows the exact per-node
   reason (bad model name, missing node), and a crash mid-run shows the node,
   the exception, and the remote's traceback tail in the panel
@@ -140,3 +141,38 @@ so the browser never talks to the remote directly (no CORS, no mixed-content
 issues), and the remote needs zero changes. Progress is relayed from the remote's
 websocket; binary live-preview frames are deliberately dropped to save
 bandwidth.
+
+## Security model
+
+ComfyCast opens a network path between your editor and a GPU box, so it is
+worth being explicit about what is trusted.
+
+Everything below is about the **editor** machine — the laptop ComfyCast is
+installed on. (The *remote* is the one you were told to start with `--listen`;
+that instruction stands, and the warning above about never port-forwarding it
+to the public internet is the important half.)
+
+**ComfyCast's routes are unauthenticated**, like ComfyUI's own API. Anything
+that can reach your editor's ComfyUI port can submit runs through ComfyCast,
+read its status, and change which remote it points at. Two things make that
+acceptable in normal use: ComfyUI binds `127.0.0.1` by default, and it
+installs an origin-only middleware that rejects cross-site browser requests —
+so a malicious web page cannot drive these routes.
+
+**Those protections vanish if you start your editor's ComfyUI with
+`--listen 0.0.0.0`.** Then treat everyone who can reach that laptop as able to
+use your remote, spend your GPU time, and read your workflows. Put it behind a
+firewall or a VPN/tailnet, not the open internet.
+
+**The remote is trusted with a lot.** It receives your workflow and any input
+files it references, and its responses drive what gets written to
+`~/ComfyCast-Outputs/`. As of v1.4.1 those paths are confined — a hostile
+remote could previously escape them — but "confined" is not the same as
+"harmless". Point this at a box you control or rent, not one a stranger hands
+you.
+
+**In transit, plain HTTP.** The settings UI builds an `http://` URL, so use
+the ssh tunnel option unless the remote is already on a private network you
+trust. The tunnel is the recommended setup for exactly this reason.
+
+Found something? Open an issue.
