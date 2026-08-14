@@ -18,6 +18,7 @@ No nodes are registered — this pack is UI + routes only.
 import asyncio
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -318,6 +319,20 @@ async def set_config(request):
     address = (body.get("address") or "").strip()
     port = int(body.get("port") or 8188)
     ssh_host = (body.get("ssh_host") or "").strip()
+    # This route is unauthenticated — anything that can reach the local ComfyUI
+    # port can repoint the tool at a host of its choosing. Validate the pieces
+    # so at minimum they cannot smuggle a scheme, a path, credentials or a
+    # second host into the URL that every later request is built from.
+    if address and not re.fullmatch(r"[A-Za-z0-9._:\-\[\]]+", address):
+        return web.json_response(
+            {"error": "address must be a bare host, IPv4, or [IPv6] — "
+                      "no scheme, path, credentials or spaces"}, status=400)
+    if not (1 <= port <= 65535):
+        return web.json_response({"error": "port out of range"}, status=400)
+    # A leading '-' would be parsed by ssh as an option, not a destination.
+    if ssh_host.startswith("-"):
+        return web.json_response(
+            {"error": "ssh_host may not start with '-'"}, status=400)
     r["comfy_port"] = port
     r["direct_url"] = f"http://{address}:{port}" if address else ""
     r["ssh_host"] = ssh_host
@@ -568,15 +583,28 @@ async def fetch(request):
     if not j or not j.get("outputs"):
         return web.json_response({"error": "no outputs for this run"}, status=404)
     cfg = load_cfg()
-    outdir = os.path.expanduser(cfg["output"]["dir"])
-    run_dir = os.path.join(outdir, pid[:8])
+    outdir = os.path.realpath(os.path.expanduser(cfg["output"]["dir"]))
+    # pid is the REMOTE's prompt_id, echoed back verbatim — never trust it as a
+    # path component. A pid of ".." put run_dir at $HOME, and since the leaf is
+    # still a basename the remote could then choose ".zshenv" and own the
+    # machine. Stripping to [0-9a-zA-Z_-] collapses ".." to "", while a real
+    # ComfyUI prompt_id (a canonical UUID) survives as its first 8 chars.
+    slug = re.sub(r"[^0-9a-zA-Z_-]", "", pid or "")[:8] or "run"
+    run_dir = os.path.join(outdir, slug)
     os.makedirs(run_dir, exist_ok=True)
     session = _get_session()
     base = await get_base(session)
     saved, total = [], 0
     for it in j["outputs"]:
         url = f"{base}/view?" + _view_query(it)
-        dest = os.path.join(run_dir, os.path.basename(it["filename"]))
+        name = os.path.basename(it.get("filename") or "")
+        if name in ("", ".", ".."):
+            continue
+        dest = os.path.join(run_dir, name)
+        # Backstop: if run_dir is ever a symlink, or basename() is defeated on
+        # some platform, the write still cannot leave the run directory.
+        if os.path.dirname(os.path.realpath(dest)) != os.path.realpath(run_dir):
+            continue
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=1800)) as r:
                 if r.status != 200:
@@ -649,8 +677,25 @@ def _stub_dest(folder, rel):
         paths = folder_paths.get_folder_paths(folder)
     except Exception:
         paths = None
-    base = paths[0] if paths else os.path.join(folder_paths.models_dir, folder)
-    return os.path.join(base, rel)
+    if paths:
+        base = paths[0]
+    else:
+        # get_folder_paths raises for an unknown key, and `folder` comes from
+        # the REMOTE's /models response. Unsanitised it escaped models_dir
+        # entirely — a folder of "../../../.ssh" wrote outside the tree. Only
+        # _safe_relpath'd names may name a directory here.
+        safe = _safe_relpath(folder or "")
+        if not safe:
+            return None
+        base = os.path.join(folder_paths.models_dir, safe)
+    # rel may legitimately be nested (checkpoints/sdxl/foo.safetensors), so this
+    # is a prefix containment check, not a parent-equality one.
+    dest = os.path.join(base, rel)
+    root = os.path.realpath(base)
+    if os.path.realpath(dest) != root and \
+            not os.path.realpath(dest).startswith(root + os.sep):
+        return None
+    return dest
 
 
 async def _fetch_model_list(machine):
@@ -700,6 +745,8 @@ def _apply_stubs(folders):
             if rel is None:
                 continue
             dest = _stub_dest(folder, rel)
+            if dest is None:          # folder escaped models_dir — skip it
+                continue
             if os.path.exists(dest):
                 skipped += 1
                 continue
