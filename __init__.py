@@ -637,7 +637,7 @@ def _safe_relpath(name):
 
 
 def _machine_key(cfg):
-    """Stable id for the connected machine, e.g. '100.78.97.1:8188' — model
+    """Stable id for the connected machine, e.g. '100.x.y.z:8188' — model
     lists are cached PER MACHINE so multi-remote parity never mixes up."""
     r = cfg.get("remote", {})
     direct = (r.get("direct_url") or "").strip()
