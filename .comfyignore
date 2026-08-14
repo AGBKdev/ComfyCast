@@ -1,0 +1,22 @@
+# Excluded from the published Comfy Registry package.
+#
+# Syntax is .gitignore's, and it layers ON TOP of .gitignore: it is for files
+# tracked in git that someone installing the pack has no use for.
+#
+# Everything else this repo ships is needed at runtime — __init__.py is the
+# backend, web/comfycast.js is the panel — so there is nothing else to drop.
+
+# Python bytecode. A .pyc embeds the absolute path of the machine that compiled
+# it, and a published archive should never carry one.
+__pycache__/
+*.py[cod]
+
+# macOS / editor droppings
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local runtime state
+output/
+*.log
