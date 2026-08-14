@@ -115,6 +115,15 @@ function setDot(state, title) {
   if (title) document.getElementById("comfycast-btn").title = title;
 }
 
+// Escape a LEAF DATA VALUE for interpolation into innerHTML. Applied to values
+// only — never to the HTML fragments this file builds deliberately (frac,
+// queue, extra, tb, html), and never stacked on something already escaped.
+// Three untrusted sources reach the panel: the config (settable over an
+// unauthenticated route), workflow node titles (hostile workflow JSON is a
+// normal thing to be sent), and error text from the remote or ssh stderr.
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
 function fmtBytes(n) {
   if (n == null) return "?";
   const u = ["B", "KB", "MB", "GB"];
@@ -130,14 +139,14 @@ async function ping(showResultIn) {
     if (d.ok) {
       setDot("ok", `remote: ComfyUI ${d.version} — ${d.gpu} (${fmtBytes(d.vram_free)} VRAM free)`);
       if (showResultIn) showResultIn.innerHTML =
-        `<span class="ck-ok">✓ connected — ComfyUI ${d.version}, ${d.gpu}, ${fmtBytes(d.vram_free)} VRAM free</span>`;
+        `<span class="ck-ok">✓ connected — ComfyUI ${esc(d.version)}, ${esc(d.gpu)}, ${fmtBytes(d.vram_free)} VRAM free</span>`;
       return true;
     }
     setDot("bad", "remote unreachable: " + d.error);
-    if (showResultIn) showResultIn.innerHTML = `<span class="ck-err">✗ ${d.error}</span>`;
+    if (showResultIn) showResultIn.innerHTML = `<span class="ck-err">✗ ${esc(d.error)}</span>`;
   } catch (e) {
     setDot("bad", "remote unreachable");
-    if (showResultIn) showResultIn.innerHTML = `<span class="ck-err">✗ ${e.message || e}</span>`;
+    if (showResultIn) showResultIn.innerHTML = `<span class="ck-err">✗ ${esc(e.message || e)}</span>`;
   }
   return false;
 }
@@ -152,13 +161,13 @@ async function openSettings() {
   } catch (e) { /* defaults */ }
   p.innerHTML = `<h4>ComfyCast — remote connection</h4>
     <label>Remote address — Tailscale IP or hostname of the machine with the GPU</label>
-    <input id="ck-addr" placeholder="e.g. 100.x.y.z or my-linux-box" value="${cfg.address || ""}"/>
+    <input id="ck-addr" placeholder="e.g. 100.x.y.z or my-linux-box" value="${esc(cfg.address)}"/>
     <label>ComfyUI port on the remote</label>
-    <input id="ck-port" value="${cfg.port || 8188}"/>
+    <input id="ck-port" value="${esc(cfg.port) || 8188}"/>
     <label>SSH fallback (user@host) — optional, used if the address doesn't answer</label>
-    <input id="ck-ssh" placeholder="e.g. me@my-linux-box" value="${cfg.ssh_host || ""}"/>
+    <input id="ck-ssh" placeholder="e.g. me@my-linux-box" value="${esc(cfg.ssh_host)}"/>
     <label>Preview quality (format;quality — smaller = less bandwidth)</label>
-    <input id="ck-prev" value="${cfg.preview || "webp;80"}"/>
+    <input id="ck-prev" value="${esc(cfg.preview) || "webp;80"}"/>
     <div class="ck-row">
       <button id="ck-save">Save &amp; test</button>
       <button id="ck-close">close</button>
@@ -193,7 +202,7 @@ async function openSettings() {
         pollSync(prog, () => {});
       }
     } catch (e) {
-      out.innerHTML = `<span class="ck-err">✗ ${e.message || e}</span>`;
+      out.innerHTML = `<span class="ck-err">✗ ${esc(e.message || e)}</span>`;
     }
   };
 }
@@ -226,12 +235,12 @@ async function pollSync(renderInto, onDone) {
     const sy = st.syncing || {};
     if (sy.running) {
       const pct = sy.total ? Math.round((100 * sy.done) / sy.total) : 5;
-      renderInto.innerHTML = `<div>${sy.phase || "working"}${sy.total ? ` — ${sy.done}/${sy.total}` : ""}</div>
+      renderInto.innerHTML = `<div>${esc(sy.phase) || "working"}${sy.total ? ` — ${sy.done}/${sy.total}` : ""}</div>
         <div class="ck-bar"><div style="width:${pct}%"></div></div>`;
     } else {
       clearInterval(timer);
-      if (sy.error) renderInto.innerHTML = `<span class="ck-err">✗ ${sy.error}</span>`;
-      else renderInto.innerHTML = `<span class="ck-ok">✓ ${sy.phase || "done"}</span>`;
+      if (sy.error) renderInto.innerHTML = `<span class="ck-err">✗ ${esc(sy.error)}</span>`;
+      else renderInto.innerHTML = `<span class="ck-ok">✓ ${esc(sy.phase) || "done"}</span>`;
       onDone && onDone(st, sy);
     }
   }, 300);
@@ -250,7 +259,7 @@ async function toggleMode() {
     });
     if (!r.ok) throw new Error((await r.json()).error || "toggle failed");
   } catch (e) {
-    p.innerHTML = `<h4>ComfyCast — models</h4><div class="ck-err">${e.message || e}</div>
+    p.innerHTML = `<h4>ComfyCast — models</h4><div class="ck-err">${esc(e.message || e)}</div>
       <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
     return;
   }
@@ -272,7 +281,7 @@ async function runOnBox() {
     const g = await app.graphToPrompt();
     prompt = g.output;
   } catch (e) {
-    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">couldn't export graph: ${e}</div>`;
+    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">couldn't export graph: ${esc(e)}</div>`;
     return;
   }
   setBusy(true);
@@ -288,10 +297,10 @@ async function runOnBox() {
         const pct = d.bytes_total ? Math.round((100 * d.bytes_done) / d.bytes_total) : 0;
         p.innerHTML = `<h4>ComfyCast</h4>
           <div>uploading input files the remote doesn't have — ${d.done}/${d.total}</div>
-          <div class="ck-dim">${d.file || ""} (${fmtBytes(d.bytes_done)} of ${fmtBytes(d.bytes_total)})</div>
+          <div class="ck-dim">${esc(d.file)} (${fmtBytes(d.bytes_done)} of ${fmtBytes(d.bytes_total)})</div>
           <div class="ck-bar"><div style="width:${pct}%"></div></div>`;
       } else {
-        p.innerHTML = `<h4>ComfyCast</h4><div class='ck-dim'>${d.phase}…</div>`;
+        p.innerHTML = `<h4>ComfyCast</h4><div class='ck-dim'>${esc(d.phase)}…</div>`;
       }
     } catch (e) {}
   }, 400);
@@ -318,7 +327,7 @@ async function runOnBox() {
   } catch (e) {
     clearInterval(subTimer);
     setBusy(false);
-    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">${e.message || e}</div>
+    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">${esc(e.message || e)}</div>
       <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
     return;
   }
@@ -356,7 +365,7 @@ function watch(pid) {
         checking the remote every couple of seconds instead. Even if this device drops offline,
         the run finishes on the remote (reopen later and Fetch).</div>`;
       p.innerHTML = `<h4>ComfyCast — running</h4>${queue}
-        <div>[${Math.min(s.done + 1, s.total)}/${s.total}] ${s.current_label || "…"}${frac}</div>
+        <div>[${Math.min(s.done + 1, s.total)}/${s.total}] ${esc(s.current_label) || "…"}${frac}</div>
         <div class="ck-bar"><div style="width:${pct}%"></div></div>${extra}
         <div class="ck-row"><button id="ck-stop" style="border-color:#a55;color:#f0a0a0">■ Stop</button></div>`;
       const stopBtn = document.getElementById("ck-stop");
@@ -373,9 +382,9 @@ function watch(pid) {
         traceback: (s.error_tb || "").split("\n"),
       });
       const tb = s.error_tb
-        ? `<pre class="ck-dim" style="max-height:140px;overflow:auto;font-size:10px;margin:6px 0 0;white-space:pre-wrap">${s.error_tb.replace(/</g, "&lt;")}</pre>`
+        ? `<pre class="ck-dim" style="max-height:140px;overflow:auto;font-size:10px;margin:6px 0 0;white-space:pre-wrap">${esc(s.error_tb)}</pre>`
         : "";
-      p.innerHTML = `<h4>ComfyCast — error on the remote</h4><div class="ck-err">${s.error || "unknown error"}</div>${tb}
+      p.innerHTML = `<h4>ComfyCast — error on the remote</h4><div class="ck-err">${esc(s.error) || "unknown error"}</div>${tb}
         <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
     } else if (s.status === "done") {
       clearInterval(pollTimer); pollTimer = null; setBusy(false);
@@ -386,7 +395,7 @@ function watch(pid) {
       const others = outs.length - imgs.length;
       let html = `<h4>ComfyCast — done ✓</h4>`;
       if (imgs.length) {
-        html += `<img src="/comfycast/preview?pid=${pid}&idx=0&t=${Date.now()}" alt="preview"/>`;
+        html += `<img src="/comfycast/preview?pid=${encodeURIComponent(pid)}&idx=0&t=${Date.now()}" alt="preview"/>`;
         if (imgs.length > 1) html += `<div class="ck-dim">${imgs.length} images — showing first (small preview)</div>`;
         else html += `<div class="ck-dim">small preview — full resolution is still on the remote</div>`;
       }
