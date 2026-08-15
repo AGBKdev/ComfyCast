@@ -49,6 +49,14 @@ const css = `
 }
 #comfycast-panel button:hover { background: #2a3138; }
 #comfycast-panel .ck-dim { color: #7c848d; }
+#comfycast-batch {
+  width: 44px; padding: 6px 4px; border-radius: 6px; border: 1px solid #3a424b;
+  background: #21262c; color: #cfd4da; font: 600 12px sans-serif; text-align: center;
+}
+#comfycast-panel .ck-run { border-top: 1px solid #262c33; padding-top: 8px; margin-top: 8px; }
+#comfycast-panel .ck-run:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+#comfycast-panel .ck-h { color: #9aa2ab; font-weight: 600; margin-bottom: 3px; }
+#comfycast-panel #ck-runs { max-height: 60vh; overflow-y: auto; }
 #comfycast-panel label { display: block; margin-top: 8px; color: #9aa2ab; }
 #comfycast-panel input {
   width: 100%; box-sizing: border-box; margin-top: 3px; padding: 5px 7px;
@@ -58,6 +66,7 @@ const css = `
 `;
 
 let pollTimer = null;
+let batchAbort = false;   // set by hidePanel() so closing the panel stops a batch
 let pingTimer = null;
 let remoteAddr = null;  // shown on the button so you know WHICH machine you're on
 
@@ -97,6 +106,7 @@ function hidePanel() {
   const p = document.getElementById("comfycast-panel");
   if (p) p.style.display = "none";
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  batchAbort = true;
 }
 
 function setBusy(b) {
@@ -272,22 +282,38 @@ async function toggleMode() {
   });
 }
 
-async function runOnBox() {
-  if (document.getElementById("comfycast-btn")?.classList.contains("busy")) return;
-  const p = panel();
-  p.innerHTML = "<h4>ComfyCast</h4><div class='ck-dim'>exporting graph…</div>";
-  let prompt;
-  try {
-    const g = await app.graphToPrompt();
-    prompt = g.output;
-  } catch (e) {
-    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">couldn't export graph: ${esc(e)}</div>`;
-    return;
+// ---------------------------------------------------------------- batch runs
+//
+// ComfyUI's batch count lives inside app.queuePrompt(number, batchCount) — the
+// loop there calls each widget's beforeQueued/afterQueued between iterations,
+// and THAT is what advances a seed set to randomize/increment. ComfyCast calls
+// graphToPrompt() directly, so without doing the same thing by hand every run
+// in a batch would submit an identical prompt and return an identical result.
+//
+// Driving the widgets rather than rewriting seeds ourselves means
+// control_after_generate keeps its normal meaning: fixed -> every run in the
+// batch shares one seed, randomize -> each run differs. Same as local ComfyUI.
+
+function eachWidget(fn) {
+  const graphs = [app.graph], seen = new Set();
+  while (graphs.length) {
+    const g = graphs.pop();
+    if (!g || seen.has(g)) continue;
+    seen.add(g);
+    for (const n of (g._nodes || g.nodes || [])) {
+      for (const w of (n.widgets || [])) { try { fn(w, n); } catch (e) {} }
+      if (n.subgraph) graphs.push(n.subgraph);   // subgraph widgets count too
+    }
   }
-  setBusy(true);
-  p.innerHTML = "<h4>ComfyCast</h4><div class='ck-dim'>sending to the remote…</div>";
+}
+const widgetsBeforeQueued = () =>
+  eachWidget((w) => w.beforeQueued?.({ isPartialExecution: false }));
+const widgetsAfterQueued = () => eachWidget((w) => w.afterQueued?.());
+
+// Submit one prompt. Returns its prompt_id, or throws with a readable message.
+async function submitOnce(onPhase) {
+  const g = await app.graphToPrompt();
   const token = Math.random().toString(36).slice(2);
-  // while the submit request runs, poll its progress (input-file uploads)
   const subTimer = setInterval(async () => {
     try {
       const r = await api.fetchApi(`/comfycast/submit_progress?token=${token}`);
@@ -295,23 +321,17 @@ async function runOnBox() {
       if (!d.phase) return;
       if (d.phase === "uploading inputs" && d.total) {
         const pct = d.bytes_total ? Math.round((100 * d.bytes_done) / d.bytes_total) : 0;
-        p.innerHTML = `<h4>ComfyCast</h4>
-          <div>uploading input files the remote doesn't have — ${d.done}/${d.total}</div>
-          <div class="ck-dim">${esc(d.file)} (${fmtBytes(d.bytes_done)} of ${fmtBytes(d.bytes_total)})</div>
-          <div class="ck-bar"><div style="width:${pct}%"></div></div>`;
-      } else {
-        p.innerHTML = `<h4>ComfyCast</h4><div class='ck-dim'>${esc(d.phase)}…</div>`;
-      }
+        onPhase(`uploading inputs — ${d.done}/${d.total}: ${esc(d.file)}`
+          + ` (${fmtBytes(d.bytes_done)} of ${fmtBytes(d.bytes_total)})`, pct);
+      } else onPhase(esc(d.phase) + "…", null);
     } catch (e) {}
   }, 400);
-  let res;
   try {
     const r = await api.fetchApi("/comfycast/submit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, token }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: g.output, token }),
     });
-    res = await r.json();
+    const res = await r.json();
     if (!r.ok) {
       let msg = res.error || "submit failed";
       if (res.detail?.node_errors) {
@@ -319,112 +339,185 @@ async function runOnBox() {
           msg += `\n${ne.class_type || "node " + nid}: ` +
             (ne.errors || []).map((e) => e.message + (e.details ? ` [${e.details}]` : "")).join("; ");
         }
-      } else if (res.detail?.error?.message) {
-        msg += `\n${res.detail.error.message}`;
-      }
+      } else if (res.detail?.error?.message) msg += `\n${res.detail.error.message}`;
       throw new Error(msg);
     }
-  } catch (e) {
-    clearInterval(subTimer);
-    setBusy(false);
-    p.innerHTML = `<h4>ComfyCast</h4><div class="ck-err">${esc(e.message || e)}</div>
-      <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
-    return;
-  }
-  clearInterval(subTimer);
-  watch(res.prompt_id);
+    return res.prompt_id;
+  } finally { clearInterval(subTimer); }
 }
 
-function watch(pid) {
-  const p = panel();
-  if (pollTimer) clearInterval(pollTimer);
-  let lastMirrored;
-  mirror("execution_start", { prompt_id: pid });
-  pollTimer = setInterval(async () => {
-    let s;
-    try {
-      const r = await api.fetchApi(`/comfycast/status?pid=${pid}`);
-      s = await r.json();
-    } catch (e) { return; }
-    if (s.status === "running") {
-      if (s.current != null && String(s.current) !== lastMirrored) {
-        lastMirrored = String(s.current);
-        mirror("executing", lastMirrored);
+// Poll one run to completion. Resolves with its final status object.
+function waitFor(pid, onTick) {
+  return new Promise((resolve) => {
+    let lastMirrored;
+    mirror("execution_start", { prompt_id: pid });
+    const t = pollTimer = setInterval(async () => {
+      // hidePanel() clears pollTimer and sets batchAbort; without both, closing
+      // the panel mid-batch leaves this polling forever and the batch running
+      // invisibly.
+      if (batchAbort) { clearInterval(t); resolve({ status: "aborted" }); return; }
+      let s;
+      try {
+        const r = await api.fetchApi(`/comfycast/status?pid=${encodeURIComponent(pid)}`);
+        s = await r.json();
+      } catch (e) { return; }
+      if (s.status === "running") {
+        if (s.current != null && String(s.current) !== lastMirrored) {
+          lastMirrored = String(s.current);
+          mirror("executing", lastMirrored);
+        }
+        if (s.max) mirror("progress", { value: s.value, max: s.max, prompt_id: pid, node: lastMirrored });
+        onTick(s);
+      } else if (s.status === "error" || s.status === "done") {
+        clearInterval(t); pollTimer = null;
+        if (s.status === "done") {
+          mirror("executing", null);
+          mirror("execution_success", { prompt_id: pid });
+        } else {
+          mirror("execution_error", {
+            prompt_id: pid, node_id: s.error_node, node_type: s.error_node_type,
+            exception_type: s.error_type || "Error",
+            exception_message: s.error_msg || s.error,
+            traceback: (s.error_tb || "").split("\n"),
+          });
+        }
+        resolve(s);
       }
-      if (s.max) mirror("progress", { value: s.value, max: s.max,
-                                      prompt_id: pid, node: lastMirrored });
-      const frac = s.max ? ` — ${s.value}/${s.max}` : "";
-      const queue = s.queue_ahead ? `<div class="ck-dim">${s.queue_ahead} job(s) ahead in queue</div>` : "";
-      const pct = s.max ? Math.round((100 * s.value) / s.max)
-        : Math.round((100 * s.done) / Math.max(s.total, 1));
-      const mm = (n) => `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
-      let extra = `<div class="ck-dim">elapsed ${mm(s.elapsed || 0)}</div>`;
-      if (s.age > 10) extra += `<div class="ck-dim">quiet for ${s.age}s — big model loads and VAE
-        decodes report no progress; the run is still going on the remote.</div>`;
-      if (s.ws === false) extra += `<div class="ck-dim">live feed unavailable on this connection —
-        checking the remote every couple of seconds instead. Even if this device drops offline,
-        the run finishes on the remote (reopen later and Fetch).</div>`;
-      p.innerHTML = `<h4>ComfyCast — running</h4>${queue}
-        <div>[${Math.min(s.done + 1, s.total)}/${s.total}] ${esc(s.current_label) || "…"}${frac}</div>
-        <div class="ck-bar"><div style="width:${pct}%"></div></div>${extra}
-        <div class="ck-row"><button id="ck-stop" style="border-color:#a55;color:#f0a0a0">■ Stop</button></div>`;
-      const stopBtn = document.getElementById("ck-stop");
-      if (stopBtn) stopBtn.onclick = async () => {
-        stopBtn.textContent = "stopping…"; stopBtn.disabled = true;
-        try { await api.fetchApi(`/comfycast/stop?pid=${pid}`, { method: "POST" }); } catch (e) {}
-      };
-    } else if (s.status === "error") {
-      clearInterval(pollTimer); pollTimer = null; setBusy(false);
-      mirror("execution_error", {
-        prompt_id: pid, node_id: s.error_node, node_type: s.error_node_type,
-        exception_type: s.error_type || "Error",
-        exception_message: s.error_msg || s.error,
-        traceback: (s.error_tb || "").split("\n"),
-      });
-      const tb = s.error_tb
-        ? `<pre class="ck-dim" style="max-height:140px;overflow:auto;font-size:10px;margin:6px 0 0;white-space:pre-wrap">${esc(s.error_tb)}</pre>`
-        : "";
-      p.innerHTML = `<h4>ComfyCast — error on the remote</h4><div class="ck-err">${esc(s.error) || "unknown error"}</div>${tb}
-        <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
-    } else if (s.status === "done") {
-      clearInterval(pollTimer); pollTimer = null; setBusy(false);
-      mirror("executing", null);
-      mirror("execution_success", { prompt_id: pid });
-      const outs = s.outputs || [];
-      const imgs = outs.filter((o) => o.kind === "images");
-      const others = outs.length - imgs.length;
-      let html = `<h4>ComfyCast — done ✓</h4>`;
-      if (imgs.length) {
-        html += `<img src="/comfycast/preview?pid=${encodeURIComponent(pid)}&idx=0&t=${Date.now()}" alt="preview"/>`;
-        if (imgs.length > 1) html += `<div class="ck-dim">${imgs.length} images — showing first (small preview)</div>`;
-        else html += `<div class="ck-dim">small preview — full resolution is still on the remote</div>`;
-      }
-      if (others > 0) html += `<div class="ck-dim">${others} non-image output(s) (video/audio) — Fetch downloads them full-size</div>`;
-      if (!outs.length) {
-        html += `<div class="ck-dim">run finished — no downloadable outputs in history.
-          Nodes that write files directly (EXR savers etc.) put them in the remote's
-          output folder; grab them with <b>comfycast fetch</b> or your file sync.</div>
-          <div class="ck-row"><button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>`;
-        p.innerHTML = html;
-        return;
-      }
-      html += `<div class="ck-row">
-        <button id="ck-fetch">Fetch full-res</button>
-        <button onclick="this.closest('#comfycast-panel').style.display='none'">close</button></div>
-        <div id="ck-fetch-out" class="ck-dim"></div>`;
-      p.innerHTML = html;
-      document.getElementById("ck-fetch").onclick = async () => {
-        const out = document.getElementById("ck-fetch-out");
-        out.textContent = "downloading full resolution…";
-        try {
-          const r = await api.fetchApi(`/comfycast/fetch?pid=${pid}`);
-          const d = await r.json();
-          if (!r.ok) throw new Error(d.error || "fetch failed");
-          out.textContent = `saved ${d.files.length} file(s), ${fmtBytes(d.bytes)} → ${d.dir}`;
-        } catch (e) { out.textContent = "fetch failed: " + (e.message || e); }
-      };
+    }, 700);
+  });
+}
+
+const mmss = (n) => `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
+
+function runningHTML(i, n, s) {
+  const frac = s.max ? ` — ${s.value}/${s.max}` : "";
+  const pct = s.max ? Math.round((100 * s.value) / s.max)
+                    : Math.round((100 * s.done) / Math.max(s.total, 1));
+  const queue = s.queue_ahead ? `<div class="ck-dim">${s.queue_ahead} job(s) ahead in queue</div>` : "";
+  let extra = `<div class="ck-dim">elapsed ${mmss(s.elapsed || 0)}</div>`;
+  if (s.age > 10) extra += `<div class="ck-dim">quiet for ${s.age}s — model loads and VAE decodes
+    report no progress; the run is still going.</div>`;
+  if (s.ws === false) extra += `<div class="ck-dim">live feed unavailable — polling instead. The run
+    finishes on the remote even if this device drops offline.</div>`;
+  return `<div class="ck-h">run ${i + 1}/${n}</div>${queue}
+    <div>[${Math.min(s.done + 1, s.total)}/${s.total}] ${esc(s.current_label) || "…"}${frac}</div>
+    <div class="ck-bar"><div style="width:${pct}%"></div></div>${extra}`;
+}
+
+// A finished run: previews inline (downloads are the cheap direction), video
+// behind a click because a clip is orders of magnitude bigger than a preview.
+function doneHTML(i, n, pid, s) {
+  const outs = s.outputs || [];
+  // idx is the ABSOLUTE position in outs, which is what /comfycast/preview
+  // indexes. Never filter first and index the filtered list.
+  let stills = 0, vids = 0, others = 0;
+  let h = `<div class="ck-h">run ${i + 1}/${n} <span class="ck-ok">✓</span></div>`;
+  outs.forEach((o, k) => {
+    if (o.video) {
+      vids++;
+      h += `<div class="ck-vid" data-pid="${encodeURIComponent(pid)}" data-idx="${k}">
+        <button class="ck-loadvid">▶ load video preview — ${esc(o.filename)}</button></div>`;
+    } else if (o.kind === "images") {
+      stills++;
+      h += `<img src="/comfycast/preview?pid=${encodeURIComponent(pid)}&idx=${k}&t=${Date.now()}" alt="preview"/>`;
+    } else others++;
+  });
+  if (stills > 1) h += `<div class="ck-dim">${stills} images — small previews</div>`;
+  if (others > 0) h += `<div class="ck-dim">${others} other output(s) — Fetch downloads them full-size</div>`;
+  if (!outs.length) h += `<div class="ck-dim">no downloadable outputs in history — nodes that write
+    files directly leave them in the remote's output folder.</div>`;
+  else h += `<div class="ck-row"><button class="ck-fetch1" data-pid="${encodeURIComponent(pid)}">Fetch full-res</button></div>
+    <div class="ck-fetch1-out ck-dim"></div>`;
+  return h;
+}
+
+function errorHTML(i, n, s) {
+  const tb = s.error_tb
+    ? `<pre class="ck-dim" style="max-height:120px;overflow:auto;font-size:10px;margin:6px 0 0;white-space:pre-wrap">${esc(s.error_tb)}</pre>`
+    : "";
+  return `<div class="ck-h">run ${i + 1}/${n} <span class="ck-err">✗</span></div>
+    <div class="ck-err">${esc(s.error) || "unknown error"}</div>${tb}`;
+}
+
+async function fetchRun(pid, outEl) {
+  outEl.textContent = "downloading full resolution…";
+  try {
+    const r = await api.fetchApi(`/comfycast/fetch?pid=${encodeURIComponent(pid)}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "fetch failed");
+    outEl.textContent = `saved ${d.files.length} file(s), ${fmtBytes(d.bytes)} → ${d.dir}`;
+  } catch (e) { outEl.textContent = "fetch failed: " + (e.message || e); }
+}
+
+// Delegated so it keeps working as rows are re-rendered.
+function wirePanel(p) {
+  if (p.dataset.wired) return;
+  p.dataset.wired = "1";
+  p.addEventListener("click", async (ev) => {
+    const lv = ev.target.closest(".ck-loadvid");
+    if (lv) {
+      const box = lv.closest(".ck-vid");
+      const src = `/comfycast/preview?pid=${box.dataset.pid}&idx=${box.dataset.idx}&t=${Date.now()}`;
+      box.innerHTML = `<video controls preload="metadata" style="max-width:100%;border-radius:6px;margin-top:6px" src="${src}"></video>`;
+      return;
     }
-  }, 700);
+    const f1 = ev.target.closest(".ck-fetch1");
+    if (f1) {
+      const out = f1.closest(".ck-run").querySelector(".ck-fetch1-out");
+      await fetchRun(decodeURIComponent(f1.dataset.pid), out);
+    }
+  });
+}
+
+async function runOnBox() {
+  if (document.getElementById("comfycast-btn")?.classList.contains("busy")) return;
+  const n = Math.max(1, Math.min(64, parseInt(
+    document.getElementById("comfycast-batch")?.value, 10) || 1));
+  const p = panel();
+  wirePanel(p);
+  batchAbort = false;
+  setBusy(true);
+  p.innerHTML = `<h4>ComfyCast${n > 1 ? ` — batch of ${n}` : ""}</h4><div id="ck-runs"></div>
+    <div class="ck-row"><button id="ck-close">close</button></div>`;
+  document.getElementById("ck-close").onclick = () => hidePanel();
+  const runs = document.getElementById("ck-runs");
+
+  for (let i = 0; i < n; i++) {
+    const row = el("div", { className: "ck-run" });
+    runs.appendChild(row);
+    row.innerHTML = `<div class="ck-h">run ${i + 1}/${n}</div><div class="ck-dim">exporting graph…</div>`;
+
+    // Advance seeds exactly where ComfyUI does: before the prompt is built.
+    widgetsBeforeQueued();
+    let pid;
+    try {
+      pid = await submitOnce((msg, pct) => {
+        row.innerHTML = `<div class="ck-h">run ${i + 1}/${n}</div><div class="ck-dim">${msg}</div>` +
+          (pct == null ? "" : `<div class="ck-bar"><div style="width:${pct}%"></div></div>`);
+      });
+    } catch (e) {
+      row.innerHTML = `<div class="ck-h">run ${i + 1}/${n} <span class="ck-err">✗</span></div>
+        <div class="ck-err">${esc(e.message || e)}</div>`;
+      widgetsAfterQueued();
+      break;                       // a rejected prompt will reject N times
+    }
+    widgetsAfterQueued();
+
+    const stopId = `ck-stop-${i}`;
+    const s = await waitFor(pid, (st) => {
+      row.innerHTML = runningHTML(i, n, st) +
+        `<div class="ck-row"><button id="${stopId}" style="border-color:#a55;color:#f0a0a0">■ Stop</button></div>`;
+      const b = document.getElementById(stopId);
+      if (b) b.onclick = async () => {
+        b.textContent = "stopping…"; b.disabled = true;
+        try { await api.fetchApi(`/comfycast/stop?pid=${encodeURIComponent(pid)}`, { method: "POST" }); } catch (e) {}
+      };
+    });
+    if (s.status === "aborted") break;
+    row.innerHTML = s.status === "done" ? doneHTML(i, n, pid, s) : errorHTML(i, n, s);
+    if (s.status === "error") break;
+  }
+  setBusy(false);
 }
 
 app.registerExtension({
@@ -436,6 +529,11 @@ app.registerExtension({
     btn.appendChild(el("span", { id: "comfycast-dot" }));
     btn.appendChild(document.createTextNode(" Run on Remote ▶"));
     btn.onclick = runOnBox;
+    const batch = el("input", { id: "comfycast-batch", type: "number", value: "1",
+      title: "How many times to run. Each run is submitted after the last finishes.\n" +
+             "Seeds follow control_after_generate: fixed = same seed every run, " +
+             "randomize = a new one each time." });
+    batch.min = "1"; batch.max = "64";
     const mode = el("button", { id: "comfycast-mode" });
     mode.textContent = "models: …";
     mode.onclick = toggleMode;
@@ -443,6 +541,7 @@ app.registerExtension({
     gear.textContent = "⚙";
     gear.onclick = openSettings;
     wrap.appendChild(btn);
+    wrap.appendChild(batch);
     wrap.appendChild(mode);
     wrap.appendChild(gear);
     document.body.appendChild(wrap);

@@ -261,15 +261,28 @@ async def _finish(base, prompt_id, entry=None):
             entry = {}
     outs = []
     for node_id, out in (entry.get("outputs") or {}).items():
+        # ComfyUI returns video under the "images" key, with a sibling
+        # "animated" flag — see comfy_api/latest/_ui.py, PreviewVideo.as_dict:
+        #   {"images": [...], "animated": (True,)}
+        # That flag is the only thing distinguishing an .mp4 from a .png here,
+        # and without it the panel renders a broken <img> pointed at a video.
+        a = out.get("animated")
+        animated = bool(a[0]) if isinstance(a, (list, tuple)) and a else bool(a)
         for key, items in out.items():
             if not isinstance(items, list):
                 continue
             for it in items:
                 if isinstance(it, dict) and "filename" in it:
-                    outs.append({"filename": it["filename"],
+                    fn = it["filename"]
+                    outs.append({"filename": fn,
                                  "subfolder": it.get("subfolder", ""),
                                  "type": it.get("type", "output"),
-                                 "kind": key})
+                                 "kind": key,
+                                 # extension is the backstop for nodes that
+                                 # never set the flag
+                                 "video": animated or fn.lower().endswith(
+                                     (".mp4", ".webm", ".mov", ".mkv",
+                                      ".avi", ".m4v"))})
     j["outputs"] = outs
     j["done"] = j["total"]
     j["current"] = j["current_label"] = None
@@ -566,7 +579,11 @@ async def preview(request):
     j = JOBS.get(pid)
     if not j or not j.get("outputs"):
         return web.json_response({"error": "no outputs for this run"}, status=404)
-    images = [o for o in j["outputs"] if o["kind"] == "images"]
+    # idx indexes ALL outputs, not a filtered subset. The panel decides what is
+    # previewable; if it filtered here and the panel filtered differently — say
+    # one list counting videos and one not — the indices would silently
+    # disagree and you would get a preview of the wrong output.
+    images = j["outputs"]
     if idx >= len(images):
         return web.json_response({"error": "index out of range"}, status=404)
     cfg = load_cfg()
@@ -574,7 +591,32 @@ async def preview(request):
     from urllib.parse import quote
     session = _get_session()
     base = await get_base(session)
-    url = f"{base}/view?" + _view_query(images[idx], "&preview=" + quote(spec))
+    item = images[idx]
+
+    if item.get("video"):
+        # No preview= for video: ComfyUI's /view only re-encodes stills, and
+        # asking it for a webp of an .mp4 is what produced the broken image.
+        # Stream the file instead of buffering it — a clip is orders of
+        # magnitude bigger than a preview and does not belong in memory.
+        url = f"{base}/view?" + _view_query(item)
+        async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=1800)) as r:
+            if r.status != 200:
+                return web.json_response(
+                    {"error": f"remote returned {r.status} for that output"},
+                    status=502)
+            resp = web.StreamResponse()
+            resp.content_type = (r.headers.get("Content-Type")
+                                 or "video/mp4").split(";")[0]
+            if r.headers.get("Content-Length"):
+                resp.content_length = int(r.headers["Content-Length"])
+            await resp.prepare(request)
+            async for chunk in r.content.iter_chunked(1 << 16):
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
+
+    url = f"{base}/view?" + _view_query(item, "&preview=" + quote(spec))
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
         data = await r.read()
         ctype = r.headers.get("Content-Type", "image/webp")
